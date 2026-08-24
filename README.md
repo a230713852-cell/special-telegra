@@ -1,0 +1,101 @@
+name: 選擇權即時T字報價
+
+# 台北時間對照（GitHub cron 用 GMT，GMT+8）：
+#   日盤 08:45–13:45 → GMT 00:45–05:45
+#   夜盤 15:00–次日05:00 → GMT 07:00–21:00（同一 GMT日）
+#
+# 排程間隔  1 分鐘，分鐘數為何是 2/17/32/47：
+#   GitHub 的 schedule 只是「盡力而為」，高負載時會直接丟掉整次排程。
+#   整點與 5 的倍數是全球排程最壅塞的時刻，刻意錯開到沒人搶的分鐘，
+#   提高真的被排到的機率。
+#
+# 分工：排程只更新網頁；要即時數據時到 Actions 手動 Run，預設會一起推播到手機。
+#
+# ── 為什麼不用 actions/deploy-pages ──
+# 2026-08-06 起這個站台的 artifact 部署管線卡死：deployment 建得出來但永遠停在
+# deployment_queued，連砍掉站台重建都一樣（實測連續 115 次輪詢狀態不動，最後逾時）。
+# 改走 Pages 的分支建置管線（Settings → Pages → Source 選 Deploy from a branch，
+# 分支 gh-pages、資料夾 /root），完全不經過 artifact 那條路。
+# gh-pages 每次都用單一 commit 強制覆蓋，所以 repo 不會被幾十次／天的更新撐大。
+on:
+  schedule:
+    - cron: '2,17,32,47 0-5 * * 1-5'     # 日盤
+    - cron: '2,17,32,47 7-21 * * 1-5'    # 夜盤
+  workflow_dispatch:
+    inputs:
+      notify:
+        description: '同時推播摘要到 iPhone (ntfy)'
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build-and-publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 安裝套件
+        run: pip install requests
+
+      - name: 取回 gh-pages 現有內容（含四象限歷史）
+        run: |
+          set -e
+          REPO="https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
+          # runner 每次都是全新的，歷史檔不先取回就等於每跑一次被清空一次。
+          # 順便把 site/ 準備好，發佈步驟直接沿用，不必再 clone 一次。
+          if ! git clone -q --depth 1 --branch gh-pages "$REPO" site; then
+            rm -rf site
+            mkdir -p site
+          fi
+          rm -rf site/.git
+          mkdir -p public
+          if [ -f "site/莊家意圖歷史.csv" ]; then
+            cp "site/莊家意圖歷史.csv" public/
+            echo "已取回四象限歷史 $(wc -l < 'public/莊家意圖歷史.csv') 行"
+          else
+            echo "gh-pages 上尚無歷史檔，這次新建"
+          fi
+
+      - name: 產生即時 T 字報價網頁
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          PAGE_URL:   ${{ vars.PAGE_URL }}
+        run: |
+          python3 "即時選擇權T字報價.py" --out public/index.html ${{ (github.event_name == 'workflow_dispatch' && inputs.notify) && '--notify' || '' }}
+
+      - name: 發佈到 gh-pages 分支
+        run: |
+          set -e
+          REPO="https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
+
+          # site/ 已在「取回 gh-pages 現有內容」那步備好（那斯達克的 ndx/ 也在裡面），
+          # 這裡只覆蓋自己負責的檔案。
+          cp public/index.html site/index.html
+          # 四象限歷史：追加後寫回，累積樣本用。寫入失敗時不擋網頁發佈。
+          if [ -f "public/莊家意圖歷史.csv" ]; then
+            cp "public/莊家意圖歷史.csv" "site/莊家意圖歷史.csv"
+          fi
+          # .nojekyll：不讓 Pages 拿 Jekyll 去處理，純靜態直接上。
+          touch site/.nojekyll
+
+          cd site
+          git init -q
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -q -m "更新 T 字報價網頁 $(TZ=Asia/Taipei date '+%Y-%m-%d %H:%M')"
+          # 強制覆蓋成單一 commit：每次都是全新 SHA（Pages 才會重新建置），
+          # 又不會累積歷史把 repo 撐大。
+          git push -q --force "$REPO" HEAD:gh-pages
